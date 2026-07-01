@@ -1,0 +1,274 @@
+# Install required dependencies
+!pip install fastapi uvicorn python-multipart nest-asyncio
+
+# Force Jupyter to generate the SSL certificates in its own working directory
+!openssl req -x509 -newkey rsa:2048 -nodes -out cert.pem -keyout key.pem -days 365 -subj "/CN=localhost"
+
+import os
+print("Checking for generated security files...")
+print("Certificate created:", os.path.exists("cert.pem"))
+print("Security Key created:", os.path.exists("key.pem"))
+
+import os
+import uuid
+import asyncio
+import nest_asyncio
+import uvicorn
+from fastapi import FastAPI, File, UploadFile, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
+
+# Allow nested event loops in Jupyter
+nest_asyncio.apply()
+app = FastAPI(title=" Video Analytics Portal", version="4.0-Local")
+
+# --- STORAGE & RECOVERY ---
+STORAGE_DIR = "video_storage"
+os.makedirs(STORAGE_DIR, exist_ok=True)
+video_db = {}
+
+print("Scanning local storage for existing memory states...")
+for file in os.listdir(STORAGE_DIR):
+    if file.endswith((".webm", ".mp4")):
+        try:
+            v_id, v_name = file.split("_", 1)
+            v_path = os.path.join(STORAGE_DIR, file)
+            video_db[v_id] = {
+                "filename": v_name, "path": v_path,
+                "content_type": "video/webm" if file.endswith(".webm") else "video/mp4",
+                "size_bytes": os.path.getsize(v_path)
+            }
+        except ValueError:
+            pass
+print(f"Successfully recovered {len(video_db)} videos from disk cache.")
+
+# --- ENDPOINT 1: INGESTION PORTAL ---
+@app.get("/", response_class=HTMLResponse)
+async def video_recorder_interface():
+    html_content = """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <title>Video Analytics Ingestion</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+        <style>
+            :root { --primary: #2563eb; --danger: #ef4444; --bg: #f3f4f6; --card: #ffffff; --text-main: #111827; --text-muted: #6b7280; }
+            body { font-family: 'Inter', sans-serif; background-color: var(--bg); color: var(--text-main); margin: 0; padding: 20px; display: flex; justify-content: center; align-items: center; min-height: 100vh; }
+            .container { background: var(--card); border-radius: 16px; padding: 32px; width: 100%; max-width: 480px; box-shadow: 0 10px 25px -5px rgba(0,0,0,0.05); border: 1px solid #e5e7eb; }
+            .header { text-align: center; margin-bottom: 24px; }
+            .header h2 { margin: 0; font-size: 1.5rem; font-weight: 600; letter-spacing: -0.025em; }
+            .header p { color: var(--text-muted); font-size: 0.9rem; margin-top: 6px; }
+            .video-wrapper { position: relative; border-radius: 12px; overflow: hidden; background: #000; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); margin-bottom: 20px; }
+            video { width: 100%; display: block; transform: scaleX(-1); }
+            
+            .rec-indicator { position: absolute; top: 12px; right: 12px; display: none; align-items: center; gap: 6px; background: rgba(0,0,0,0.65); color: white; padding: 6px 12px; border-radius: 20px; font-size: 0.75rem; font-weight: 600; backdrop-filter: blur(4px); }
+            .dot { width: 8px; height: 8px; background-color: var(--danger); border-radius: 50%; animation: pulse 1.5s infinite; }
+            @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.7); } 70% { box-shadow: 0 0 0 6px rgba(239, 68, 68, 0); } 100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); } }
+            
+            .controls { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 16px; }
+            button { font-family: 'Inter', sans-serif; padding: 12px; border: none; border-radius: 8px; font-weight: 600; font-size: 0.95rem; cursor: pointer; transition: all 0.2s ease; }
+            #startBtn { background: var(--text-main); color: white; }
+            #startBtn:hover:not(:disabled) { background: #374151; transform: translateY(-1px); }
+            #stopBtn { background: var(--danger); color: white; }
+            #stopBtn:hover:not(:disabled) { background: #dc2626; transform: translateY(-1px); }
+            button:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
+            
+            #status { text-align: center; font-size: 0.85rem; color: var(--text-muted); font-weight: 500; min-height: 20px; }
+            .divider { height: 1px; background: #e5e7eb; margin: 24px 0; }
+            .nav-btn { display: block; text-align: center; padding: 12px; text-decoration: none; color: var(--text-main); font-weight: 500; border: 1px solid #e5e7eb; border-radius: 8px; transition: all 0.2s; font-size: 0.95rem; }
+            .nav-btn:hover { background: #f9fafb; border-color: #d1d5db; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="header">
+                <h2>Video Analytics Portal</h2>
+                <p>Secure LAN Ingestion Pipeline</p>
+            </div>
+            
+            <div class="video-wrapper">
+                <div class="rec-indicator" id="recBadge"><div class="dot"></div> REC</div>
+                <video id="preview" autoplay muted playsinline></video>
+            </div>
+            
+            <div class="controls">
+                <button id="startBtn">Start Capture</button>
+                <button id="stopBtn" disabled>Stop & Sync</button>
+            </div>
+            
+            <div id="status">System initialized. Awaiting camera...</div>
+            <div class="divider"></div>
+            <a href="/gallery" class="nav-btn">Access Central Storage ➔</a>
+        </div>
+
+        <script>
+            let mediaRecorder;
+            let recordedChunks = [];
+            const preview = document.getElementById('preview');
+            const startBtn = document.getElementById('startBtn');
+            const stopBtn = document.getElementById('stopBtn');
+            const status = document.getElementById('status');
+            const recBadge = document.getElementById('recBadge');
+
+            navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" }, audio: true })
+                .then(stream => {
+                    preview.srcObject = stream;
+                    mediaRecorder = new MediaRecorder(stream, { mimeType: 'video/webm' });
+                    mediaRecorder.ondataavailable = (e) => { if (e.data.size > 0) recordedChunks.push(e.data); };
+
+                    mediaRecorder.onstop = async () => {
+                        status.innerText = "Processing payload...";
+                        recBadge.style.display = "none";
+                        const blob = new Blob(recordedChunks, { type: 'video/webm' });
+                        recordedChunks = [];
+                        const formData = new FormData();
+                        formData.append("file", blob, `live_capture_${Date.now()}.webm`);
+
+                        try {
+                            const response = await fetch('/api/v1/upload/', { method: 'POST', body: formData });
+                            status.innerText = "Upload successful. Synced to secure local memory.";
+                        } catch (err) {
+                            status.innerText = "Connection timeout. Upload failed.";
+                        }
+                    };
+                    status.innerText = "Camera ready.";
+                }).catch(err => { status.innerText = "Hardware access denied by browser."; });
+
+            startBtn.onclick = () => { mediaRecorder.start(); startBtn.disabled = true; stopBtn.disabled = false; status.innerText = "Streaming to buffer..."; recBadge.style.display = "flex"; };
+            stopBtn.onclick = () => { mediaRecorder.stop(); startBtn.disabled = false; stopBtn.disabled = true; };
+        </script>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html_content)
+
+# --- ENDPOINT 2: PLAYBACK GALLERY ---
+@app.get("/gallery", response_class=HTMLResponse)
+async def video_gallery_interface():
+    html_content = """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <title>Central Storage</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+        <style>
+            :root { --primary: #2563eb; --bg: #f3f4f6; --card: #ffffff; --text-main: #111827; --text-muted: #6b7280; }
+            body { font-family: 'Inter', sans-serif; background-color: var(--bg); color: var(--text-main); margin: 0; padding: 20px; display: flex; justify-content: center; align-items: center; min-height: 100vh; }
+            .container { background: var(--card); border-radius: 16px; padding: 32px; width: 100%; max-width: 600px; box-shadow: 0 10px 25px -5px rgba(0,0,0,0.05); border: 1px solid #e5e7eb; }
+            .header { margin-bottom: 24px; text-align: center; }
+            .header h2 { margin: 0; font-size: 1.5rem; font-weight: 600; letter-spacing: -0.025em; }
+            video { width: 100%; border-radius: 12px; background: #000; margin-bottom: 24px; outline: none; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); }
+            .video-list { border: 1px solid #e5e7eb; border-radius: 12px; overflow-y: auto; max-height: 350px; background: #fafafa; }
+            .video-item { padding: 16px; border-bottom: 1px solid #e5e7eb; display: flex; justify-content: space-between; align-items: center; transition: background 0.2s; background: #fff;}
+            .video-item:hover { background: #f3f4f6; }
+            .video-item:last-child { border-bottom: none; }
+            .video-info h4 { margin: 0 0 4px 0; font-size: 0.95rem; font-weight: 600; color: var(--text-main); }
+            .video-info p { margin: 0; font-size: 0.8rem; color: var(--text-muted); font-family: monospace; }
+            .play-btn { background: var(--text-main); color: white; border: none; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-size: 0.85rem; font-weight: 600; transition: background 0.2s; }
+            .play-btn:hover { background: #374151; }
+            .nav-btn { display: block; text-align: center; padding: 12px; text-decoration: none; color: var(--text-main); font-weight: 500; border: 1px solid #e5e7eb; border-radius: 8px; margin-top: 24px; transition: all 0.2s; font-size: 0.95rem; }
+            .nav-btn:hover { background: #f9fafb; border-color: #d1d5db; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="header">
+                <h2>Secure Memory Storage Node</h2>
+            </div>
+            <video id="player" controls playsinline></video>
+            <div class="video-list" id="videoList"><div style="padding: 20px; text-align: center; color: var(--text-muted);">Querying local storage records...</div></div>
+            <a href="/" class="nav-btn">⬅ Back to Ingestion Portal</a>
+        </div>
+
+        <script>
+            fetch('/api/v1/videos/')
+                .then(response => response.json())
+                .then(data => {
+                    const listContainer = document.getElementById('videoList');
+                    listContainer.innerHTML = ''; 
+                    const videos = data.videos;
+                    const videoIds = Object.keys(videos);
+                    
+                    if (videoIds.length === 0) {
+                        listContainer.innerHTML = '<div style="padding: 20px; text-align: center; color: var(--text-muted);">No video objects found in local memory.</div>';
+                        return;
+                    }
+
+                    videoIds.reverse().forEach(id => {
+                        const videoData = videos[id];
+                        const item = document.createElement('div');
+                        item.className = 'video-item';
+                        const sizeMB = (videoData.size_bytes / (1024 * 1024)).toFixed(2);
+                        
+                        item.innerHTML = `
+                            <div class="video-info">
+                                <h4>${videoData.filename}</h4>
+                                <p>SIZE: ${sizeMB} MB | HASH: ${id.substring(0, 12).toUpperCase()}</p>
+                            </div>
+                            <button class="play-btn">Play</button>
+                        `;
+                        item.onclick = () => {
+                            const player = document.getElementById('player');
+                            player.src = `/api/v1/stream/${id}`;
+                            player.play();
+                            window.scrollTo({ top: 0, behavior: 'smooth' });
+                        };
+                        listContainer.appendChild(item);
+                    });
+                })
+                .catch(err => { document.getElementById('videoList').innerHTML = '<div style="padding: 20px; text-align: center; color: #ef4444;">Error mapping database records.</div>'; });
+        </script>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html_content)
+
+# --- ENDPOINT 3: BACKEND UPLOAD PIPELINE ---
+@app.post("/api/v1/upload/")
+async def upload_video(file: UploadFile = File(...)):
+    if not file.content_type.startswith("video/"):
+        raise HTTPException(status_code=400, detail="Invalid file type.")
+        
+    video_id = str(uuid.uuid4())
+    file_path = os.path.join(STORAGE_DIR, f"{video_id}_{file.filename}")
+    
+    with open(file_path, "wb") as buffer:
+        while chunk := await file.read(1024 * 1024):
+            buffer.write(chunk)
+            
+    video_db[video_id] = {
+        "filename": file.filename, "path": file_path,
+        "content_type": file.content_type, "size_bytes": os.path.getsize(file_path)
+    }
+    return {"message": "Success", "video_id": video_id}
+
+# --- ENDPOINT 4: METADATA RETRIEVAL ---
+@app.get("/api/v1/videos/")
+async def list_videos():
+    return {"videos": video_db}
+
+# --- ENDPOINT 5: MEDIA STREAMING ---
+@app.get("/api/v1/stream/{video_id}")
+async def stream_video(video_id: str, request: Request):
+    if video_id not in video_db:
+        raise HTTPException(status_code=404, detail="Video not found.")
+    return FileResponse(path=video_db[video_id]["path"], media_type=video_db[video_id]["content_type"])
+# --- SERVER BOOT ---
+if __name__ == "__main__":
+    print("\n============================================================")
+    print("🔒 SECURE LOCAL NETWORK SERVER ONLINE")
+    print("To access on another device, connect to this Wi-Fi and navigate to:")
+  print("https://<YOUR_IP_ADDRESS>:8001")  # <-- ADD YOUR IP HERE
+    print("============================================================\n")
+    
+    # Add the SSL arguments to Uvicorn
+    config = uvicorn.Config(
+        app, 
+        host="0.0.0.0", 
+        port=8001,
+        ssl_keyfile="key.pem",
+        ssl_certfile="cert.pem"
+    )
+    server = uvicorn.Server(config)
+    await server.serve()
