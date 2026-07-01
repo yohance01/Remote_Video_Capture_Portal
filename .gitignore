@@ -10,4 +10,4 @@ venv/
 # Private photos
 photos/
 images/private/
-git rm -r --cached ROJECT_PROOFS
+git rm -r --cached PROJECT_PROOFS
